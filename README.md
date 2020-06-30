@@ -1,10 +1,11 @@
 # yavta
-Fork of yavta from git://git.ideasonboard.org/yavta.git, modified to support V4L2 to MMAL.
+Fork of yavta from git://git.ideasonboard.org/yavta.git, modified to support V4L2 to MMAL by 6by9 and added image capture by danriches.
 
 Sets up the pipe:
 ```
-V4L2 -> isp -> video_splitter -> video_render
-                              -> video_encode -> file
+V4L2 -> isp -> video_render
+            -> video_encode -> file
+            -> image_encode -> file
 ```
 Example command line:
 ```
