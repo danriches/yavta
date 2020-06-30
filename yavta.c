@@ -1768,25 +1768,30 @@ static void * save_image_thread(void *arg)
 		if (!buffer)
 			continue;
 
-		//fprintf(stderr, "Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
+		fprintf(stderr, "Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
 		//This needs to check the gpio pin!! - DJR
-		//if (dev->image_fd)
 		if(lockout == 0 && countdown == 0)
 		{
 			lockout = 1;
-			dev->image_fd = fopen("\ramdisk\tempimg.jpg", "wb");
-			bytes_written = fwrite(buffer->data, 1, buffer->length, dev->image_fd);
-			fflush(dev->image_fd);
-			fclose(dev->image_fd);
-			if (bytes_written != buffer->length)
+			fprintf(stderr, "writing image file\n");
+			if (!dev->image_fd)
 			{
-				fprintf(stderr, "Failed to write image buffer data (%d from %d)- aborting", bytes_written, buffer->length);
-			} else
-			{
-				//start a thread to copy over the image file - DJR
+				dev->image_fd = fopen("/ramdisk/tempimg.jpg", "wb");
+				bytes_written = fwrite(buffer->data, 1, buffer->length, dev->image_fd);
+				fflush(dev->image_fd);
+				fclose(dev->image_fd);
+				if (bytes_written != buffer->length)
+				{
+					fprintf(stderr, "Failed to write image buffer data (%d from %d)- aborting", bytes_written, buffer->length);
+				} else
+				{
+					//start a thread to copy over the image file - DJR
+					fprintf(stderr, "written image file (%d from %d)\n", bytes_written, buffer->length);
+				}
 			}
 		} else
 		{
+			fprintf(stderr, "Countdown: %d", countdown);
 			countdown--;
 		}
 		
@@ -2134,7 +2139,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			fprintf(stderr, "Failed to commit image encoder input format\n");
 		
 		//Set output to jpeg
-		image_encoder_output->format->encoding = MMAL_ENCODING_JPEG;
+		image_encoder_output->format->encoding = MMAL_ENCODING_JPEG;		//Was JPEG, set to MJPEG for vc.ril.video_encode
 		
 		image_encoder_output->buffer_size = image_encoder_output->buffer_size_recommended;
 
@@ -2166,7 +2171,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 	   }
 
 	   // Set the JPEG restart interval - not sure what this is so set to zero as RaspiVid did as default
-	   status = mmal_port_parameter_set_uint32(encoder_output, MMAL_PARAMETER_JPEG_RESTART_INTERVAL, 0);
+	   status = mmal_port_parameter_set_uint32(image_encoder_output, MMAL_PARAMETER_JPEG_RESTART_INTERVAL, 0);
 
 	   if (status != MMAL_SUCCESS)
 	   {
@@ -2174,7 +2179,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		  return -1;
 	   }
 	   
-	   fprintf(stderr, "Enable image encoder....\n");
+		fprintf(stderr, "Enable image encoder....\n");
 		status = mmal_component_enable(dev->iencoder);
 		if(status != MMAL_SUCCESS)
 		{
@@ -2401,6 +2406,9 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			}
 			fprintf(stderr, "Sent buffer %p\n", buffer);
 		}
+	} else
+	{
+		fprintf(stderr, "NO IENCODER!\n");
 	}
 
 	// open h264 file and put the file handle in userdata for the encoder output port
@@ -2439,12 +2447,12 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			return -1;
 		}
 		
-		//dev->save_image_queue = mmal_queue_create();
-		//if(!dev->save_image_queue)
-		//{
-			//fprintf(stderr, "Failed to create image queue\n");
-			//return -1;
-		//}
+		dev->save_image_queue = mmal_queue_create();
+		if(!dev->save_image_queue)
+		{
+			fprintf(stderr, "Failed to create image queue\n");
+			return -1;
+		}
 
 		//Save video save thread
 		vcos_status = vcos_thread_create(&dev->save_thread, "save-thread",
@@ -2456,12 +2464,12 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		}
 
 		//Save image save thread
-		//vcos_status = vcos_thread_create(&dev->save_image_thread, "save-image-thread", NULL, save_image_thread, dev);
-		//if(vcos_status != VCOS_SUCCESS)
-		//{
-			//fprintf(stderr, "Failed to create image save thread\n");
-			//return -1;
-		//}
+		vcos_status = vcos_thread_create(&dev->save_image_thread, "image-thread", NULL, save_image_thread, dev);
+		if(vcos_status != VCOS_SUCCESS)
+		{
+			fprintf(stderr, "Failed to create image save thread\n");
+			return -1;
+		}
 
 		status = mmal_port_enable(encoder_output, encoder_buffer_callback);
 		if(status != MMAL_SUCCESS)
@@ -2647,6 +2655,7 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
                 tv.tv_sec = 10;
                 tv.tv_usec = 0;
 
+				//Stops here after two buffers are processed but only after adding the image_encode component, why??
                 r = select(dev->fd + 1, rd_fds, wr_fds, ex_fds, &tv);
 
                 if (-1 == r) {
@@ -2661,120 +2670,129 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
                 }
 
                 if (rd_fds && FD_ISSET(dev->fd, rd_fds)) {
-			const char *ts_type, *ts_source;
-			int queue_buffer = 1;
-			/* Dequeue a buffer. */
-			memset(&buf, 0, sizeof buf);
-			memset(planes, 0, sizeof planes);
+					const char *ts_type, *ts_source;
+					int queue_buffer = 1;
+					/* Dequeue a buffer. */
+					memset(&buf, 0, sizeof buf);
+					memset(planes, 0, sizeof planes);
 
-			buf.type = dev->type;
-			buf.memory = dev->memtype;
-			buf.length = VIDEO_MAX_PLANES;
-			buf.m.planes = planes;
+					buf.type = dev->type;
+					buf.memory = dev->memtype;
+					buf.length = VIDEO_MAX_PLANES;
+					buf.m.planes = planes;
 
-			ret = ioctl(dev->fd, VIDIOC_DQBUF, &buf);
-			if (ret < 0) {
-				if (errno != EIO) {
-					fprintf(stderr, "Unable to dequeue buffer: %s (%d).\n",
-						strerror(errno), errno);
-					goto done;
-				}
-				buf.type = dev->type;
-				buf.memory = dev->memtype;
-				if (dev->memtype == V4L2_MEMORY_USERPTR)
-					video_buffer_fill_userptr(dev, &dev->buffers[i], &buf);
-			}
-
-			if (video_is_capture(dev))
-				video_verify_buffer(dev, &buf);
-			//fprintf(stderr, "bytesused in buffer is %d\n", buf.bytesused);
-			size += buf.bytesused;
-
-			fps = (buf.timestamp.tv_sec - last.tv_sec) * 1000000
-			    + buf.timestamp.tv_usec - last.tv_usec;
-			fps = fps ? 1000000.0 / fps : 0.0;
-
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			get_ts_flags(buf.flags, &ts_type, &ts_source);
-			fprintf(stderr, "%u (%u) [%c] %s %u %u B %ld.%06ld %ld.%06ld %.3f fps ts %s/%s\n", i, buf.index,
-				(buf.flags & V4L2_BUF_FLAG_ERROR) ? 'E' : '-',
-				v4l2_field_name(buf.field),
-				buf.sequence, video_buffer_bytes_used(dev, &buf),
-				buf.timestamp.tv_sec, buf.timestamp.tv_usec,
-				ts.tv_sec, ts.tv_nsec/1000, fps,
-				ts_type, ts_source);
-
-			last = buf.timestamp;
-
-			/* Save the image. */
-			if (video_is_capture(dev) && pattern && !skip)
-				video_save_image(dev, &buf, pattern, i);
-
-			if (dev->mmal_pool) {
-				MMAL_BUFFER_HEADER_T *mmal;
-				MMAL_STATUS_T status;
-				while ((mmal = mmal_queue_get(dev->mmal_pool->queue)) && !mmal->user_data) {
-					fprintf(stderr, "Discarding MMAL buffer %p as not mapped\n", mmal);
-				}
-				if (!mmal) {
-					fprintf(stderr, "Failed to get MMAL buffer\n");
-				} else {
-					/* Need to wait for MMAL to be finished with the buffer before returning to V4L2 */
-					queue_buffer = 0;
-					if (((struct buffer*)mmal->user_data)->idx != buf.index) {
-						fprintf(stderr, "Mismatch in expected buffers. V4L2 gave idx %d, MMAL expecting %d\n",
-							buf.index, ((struct buffer*)mmal->user_data)->idx);
+					ret = ioctl(dev->fd, VIDIOC_DQBUF, &buf);
+					if (ret < 0) {
+						if (errno != EIO) {
+							fprintf(stderr, "Unable to dequeue buffer: %s (%d).\n",
+								strerror(errno), errno);
+							goto done;
+						}
+						buf.type = dev->type;
+						buf.memory = dev->memtype;
+						if (dev->memtype == V4L2_MEMORY_USERPTR)
+							video_buffer_fill_userptr(dev, &dev->buffers[i], &buf);
 					}
-					/*if (buf.bytesused != buf.length)
+
+					if (video_is_capture(dev))
+						video_verify_buffer(dev, &buf);
+					//fprintf(stderr, "bytesused in buffer is %d\n", buf.bytesused);
+					size += buf.bytesused;
+
+					fps = (buf.timestamp.tv_sec - last.tv_sec) * 1000000
+						+ buf.timestamp.tv_usec - last.tv_usec;
+					fps = fps ? 1000000.0 / fps : 0.0;
+
+					clock_gettime(CLOCK_MONOTONIC, &ts);
+					get_ts_flags(buf.flags, &ts_type, &ts_source);
+					//fprintf(stderr, "%u (%u) [%c] %s %u %u B %ld.%06ld %ld.%06ld %.3f fps ts %s/%s\n", i, buf.index,
+						//(buf.flags & V4L2_BUF_FLAG_ERROR) ? 'E' : '-',
+						//v4l2_field_name(buf.field),
+						//buf.sequence, video_buffer_bytes_used(dev, &buf),
+						//buf.timestamp.tv_sec, buf.timestamp.tv_usec,
+						//ts.tv_sec, ts.tv_nsec/1000, fps,
+						//ts_type, ts_source);
+
+					last = buf.timestamp;
+
+					/* Save the image. */
+					//fprintf(stderr, "Calling video save image\n");
+					if (video_is_capture(dev) && pattern && !skip)
+						video_save_image(dev, &buf, pattern, i);
+
+					//fprintf(stderr, "Checking mmal pool\n");
+					if (dev->mmal_pool) {
+						MMAL_BUFFER_HEADER_T *mmal;
+						MMAL_STATUS_T status;
+						while ((mmal = mmal_queue_get(dev->mmal_pool->queue)) && !mmal->user_data) {
+							fprintf(stderr, "Discarding MMAL buffer %p as not mapped\n", mmal);
+						}
+						if (!mmal) {
+							fprintf(stderr, "Failed to get MMAL buffer\n");
+						} else {
+							/* Need to wait for MMAL to be finished with the buffer before returning to V4L2 */
+							queue_buffer = 0;
+							if (((struct buffer*)mmal->user_data)->idx != buf.index) {
+								fprintf(stderr, "Mismatch in expected buffers. V4L2 gave idx %d, MMAL expecting %d\n",
+									buf.index, ((struct buffer*)mmal->user_data)->idx);
+							}
+							/*if (buf.bytesused != buf.length)
+							{
+								fprintf(stderr, "V4L2 buffer came back as shorter than allocated - length %u, bytesused %u\n",
+									   buf.length, buf.bytesused);
+							}*/
+							mmal->length = buf.length;	//Deliberately use length as MMAL wants the padding
+
+							if (!dev->starttime.tv_sec)
+								dev->starttime = buf.timestamp;
+
+							struct timeval pts;
+							timersub(&buf.timestamp, &dev->starttime, &pts);
+							//MMAL PTS is in usecs, so convert from struct timeval
+							mmal->pts = (pts.tv_sec * 1000000) + pts.tv_usec;
+							if (mmal->pts > (dev->lastpts+dev->frame_time_usec+1000)) {
+								fprintf(stderr, "DROPPED FRAME - %lld and %lld, delta %lld\n", dev->lastpts, mmal->pts, mmal->pts-dev->lastpts);
+								dropped_frames++;
+							}
+							dev->lastpts = mmal->pts;
+
+							mmal->flags = MMAL_BUFFER_HEADER_FLAG_FRAME_END;
+							//mmal->pts = buf.timestamp;
+							status = mmal_port_send_buffer(dev->isp->input[0], mmal);
+							if (status != MMAL_SUCCESS)
+								fprintf(stderr, "mmal_port_send_buffer failed %d\n", status);
+						}
+					}
+					//fprintf(stderr, "Done checking mmal pool\n");
+					if (skip)
+						--skip;
+
+					/* Requeue the buffer. */
+					if (delay > 0)
+						usleep(delay * 1000);
+
+					fflush(stdout);
+
+					i++;
+
+					if (i >= nframes - dev->nbufs && !do_requeue_last)
 					{
-						fprintf(stderr, "V4L2 buffer came back as shorter than allocated - length %u, bytesused %u\n",
-						       buf.length, buf.bytesused);
-					}*/
-					mmal->length = buf.length;	//Deliberately use length as MMAL wants the padding
-
-					if (!dev->starttime.tv_sec)
-						dev->starttime = buf.timestamp;
-
-					struct timeval pts;
-					timersub(&buf.timestamp, &dev->starttime, &pts);
-					//MMAL PTS is in usecs, so convert from struct timeval
-					mmal->pts = (pts.tv_sec * 1000000) + pts.tv_usec;
-					if (mmal->pts > (dev->lastpts+dev->frame_time_usec+1000)) {
-						fprintf(stderr, "DROPPED FRAME - %lld and %lld, delta %lld\n", dev->lastpts, mmal->pts, mmal->pts-dev->lastpts);
-						dropped_frames++;
+						//fprintf(stderr, "Continue 1\n");
+						continue;
 					}
-					dev->lastpts = mmal->pts;
+					if (!queue_buffer)
+					{
+						//fprintf(stderr, "Continue 2\n");
+						continue;
+					}
 
-					mmal->flags = MMAL_BUFFER_HEADER_FLAG_FRAME_END;
-					//mmal->pts = buf.timestamp;
-					status = mmal_port_send_buffer(dev->isp->input[0], mmal);
-					if (status != MMAL_SUCCESS)
-						fprintf(stderr, "mmal_port_send_buffer failed %d\n", status);
-				}
-			}
-
-			if (skip)
-				--skip;
-
-			/* Requeue the buffer. */
-			if (delay > 0)
-				usleep(delay * 1000);
-
-			fflush(stdout);
-
-			i++;
-
-			if (i >= nframes - dev->nbufs && !do_requeue_last)
-				continue;
-			if (!queue_buffer)
-				continue;
-
-			ret = video_queue_buffer(dev, buf.index, fill);
-			if (ret < 0) {
-				fprintf(stderr, "Unable to requeue buffer: %s (%d).\n",
-					strerror(errno), errno);
-				goto done;
-			}
+					ret = video_queue_buffer(dev, buf.index, fill);
+					if (ret < 0) {
+						fprintf(stderr, "Unable to requeue buffer: %s (%d).\n",
+							strerror(errno), errno);
+						goto done;
+					} //else
+					//fprintf(stderr, "Requeued buffer\n");
                 }
                 if (wr_fds && FD_ISSET(dev->fd, wr_fds)) {
                     fprintf(stderr, "Writing?!?!?\n");
