@@ -18,7 +18,11 @@
  */
 
 #define __STDC_FORMAT_MACROS
+#define NETDEVICES "/proc/net/dev"
+#define _GNU_SOURCE
 
+#include <argp.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -36,6 +40,9 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/wait.h>
+#include <uuid/uuid.h>
+#include <pthread.h>
 
 #include <linux/videodev2.h>
 
@@ -46,17 +53,970 @@
 #include "interface/mmal/util/mmal_util_params.h"
 #include "bcm_host.h"
 #include "user-vcsm.h"
-
-
+// Hardware IO libs
+#include <wiringPi.h>
+#include <mcp23017.h>
 
 #ifndef V4L2_BUF_FLAG_ERROR
 #define V4L2_BUF_FLAG_ERROR	0x0040
 #endif
 
+//Function prototypes
+void sleep_ms(int milliseconds);
+void* WaitOnTrigger(void* arg);
+int SetStatusLED(int Red, int Green,int Blue);
+int CaptureImage(void);
+int CaptureVideo(void);
+void PlaySystemStartedSound(void);
+void PlayCaptureImageSound(void);
+void PlayCaptureVideoStartSound(void);
+void PlayCaptureVideoStoppedSound(void);
+void PlayFailedSound(void);
+void ApplySettings(void);
+void ResetSettings(void);
+void cleanExit(int sig);
+void IsSoundEnabled(void);
+void GetImgLowTiming(void);
+void GetImgHighTiming(void);
+void GetVideoThresholdTiming(void);
+void CreateGUID();
+
 #define ARRAY_SIZE(a)	(sizeof(a)/sizeof((a)[0]))
 
 int debug = 0;
-//#define print(...) do { if (debug) fprintf(__VA_ARGS__); }  while (0)
+pthread_t ptid;		//Trigger and file move thread
+static int StartLocalRTSPClient;
+
+uuid_t uuid;
+char thisGUID[37];
+uint64_t SequenceNumber = 1;
+
+#define redled 100
+#define grnled 101
+#define bluled 102
+#define Piezo 23		//GPIO 13
+#define TriggerPin 2
+#define SoundHiLo 103
+#define SoundEn 104
+#define SysFaultLED 105
+//Config Switches
+//#define 50_60Hz	
+#define PAL_NTSC 108
+#define TEST_MODE 115
+
+/* GPIO PIN LIST
+ * BCM No	Function		WiringPi No		physical pin	ImagePort Function
+ * 2		I2C	SDA			8				3				SGTL5000XNAA & MCP23017
+ * 3		I2C	SCL			9				5				SGTL5000XNAA & MCP23017
+ * 4		GPIO_GCLK		7				7				TC358743 HDMI Codec Reset
+ * 5		GENERIC			21				29				
+ * 6		GENERIC			22				31				
+ * 7		SPI				11				26				Reserved
+ * 8		SPI				10			// Max bitrate we allow for recording
+const int MAX_BITRATE_MJPEG = 25000000; // 25Mbits/s
+const int MAX_BITRATE_LEVEL4 = 25000000; // 25Mbits/s
+const int MAX_BITRATE_LEVEL42 = 62500000; // 62.5Mbits/s	24				Reserved
+ * 9		SPI				13				21				Reserved
+ * 10		SPI				12				19				Reserved
+ * 11		SPI				14				23				Reserved
+ * 12		GENERIC			26				32				
+ * 13		GENERIC			23				33				PWM Sounder Output
+ * 14		Serial Tx		15				8				Serial Debug Header
+ * 15		Serial Rx		16				10				Serial Debug Header
+ * 16		GENERIC			27				36				
+ * 17		GENERIC			0				11				MCP23017 Reset Line - Drive High for normal operation
+ * 18		GENERIC			1				12				SGTL5000XNAA Audio BCLK
+ * 19		I2S				24				35				SGTL5000XNAA Audio LRCLK
+ * 20		I2S				28				38				SGTL5000XNAA Audio DIN
+ * 21		I2S				29				40				SGTL5000XNAA Audio DOUT
+ * 22		GENERIC			3				15				
+ * 23		GENERIC			4				16				
+ * 24		GENERIC			5				18				
+ * 25		GENERIC			6				22				
+ * 26		GENERIC			25				37				
+ * 27		GENERIC			2				13				Trigger Input
+ * MCP23017					100								Red LED in RGB LED
+ * MCP23017					101								Green LED in RGB LED
+ * MCP23017					102								Blue LED in RGB LED
+ * MCP23017					103								Sound Hi / Lo
+ * MCP23017					104								Sound Enable
+ * MCP23017					105								System Network Activity LED
+ * MCP23017					106								NC	- Was SGTL_ADR0
+ * MCP23017					107								NC	- Was SGTL_CTRL_MODE
+ * MCP23017					108								Config Switch 1
+ * MCP23017					109								Config Switch 2
+ * MCP23017					110								Config Switch 3
+ * MCP23017					111								Config Switch 4
+ * MCP23017					112								Config Switch 5
+ * MCP23017					113								Config Switch 6
+ * MCP23017					114								Config Switch 7
+ * MCP23017					115								Config Switch 8
+ */
+
+//Settings
+char settingRemoteHost[30];
+char settingRemoteHostPort[10];
+char settingSoundEnabled[6];
+char settingImageLowTiming[4];
+char settingImageHighTiming[4];
+char settingVideoThresholdTiming[5];
+static int SoundIsEnabled = 0;
+static int ImageLowTiming = 50;
+static int ImageHighTiming = 6000;
+static int VideoThresholdTiming = 6000;
+char settingPPMount[300];
+char settingPPRSYNC[300];
+char settingPPFIND[300];
+
+//Globals
+int applicationStart = 0;
+int HDMI_mode = 0;			//0 is HDMI and 1 is CVBS
+int AutoReboot = 1;			//Auto Reboot on no CVBS signal, DIP SW 5 UP is reboot, DOWN is no reboot just carry on as normal
+char lastfilename[255];
+
+//Image Capture Trigger Globals
+static int lockout = 0;
+static int trigger = 0;
+static int CapFrameDone = 0;
+static int waitRelease = 0;
+static int timing = 0;
+static int CapType = 0;
+static int triggerLevel = 0;		//Normally should be 1
+
+// Max bitrate we allow for recording
+const int MAX_BITRATE_MJPEG = 25000000; // 25Mbits/s
+const int MAX_BITRATE_LEVEL4 = 25000000; // 25Mbits/s
+const int MAX_BITRATE_LEVEL42 = 62500000; // 62.5Mbits/s
+
+//Network Activity LED variables
+static unsigned int o_refresh = 20; /* milliseconds */
+static unsigned int o_gpiopin = 105; /* wiringPi numbering scheme */
+//static int o_detach = 0;
+
+static volatile sig_atomic_t running = 1;
+static char *line = NULL;
+static size_t len = 0;
+
+int status = EXIT_FAILURE;
+FILE *netdevices = NULL;
+struct timespec delay2;
+
+/* FUNCTIONS HERE ON */
+/* Reread the netdevices file */
+int activity(FILE *netdevices) {
+        static unsigned int prev_inpackets, prev_outpackets;
+        unsigned int inpackets, outpackets;
+        unsigned int device_inpackets, device_outpackets;
+        int found_inpackets, found_outpackets;
+        int result;
+        char *ptr;
+        char device[32];
+
+        /* Go to the beginning of the netdevices file */
+        result = TEMP_FAILURE_RETRY(fseek(netdevices, 0L, SEEK_SET));
+        if (result) {
+                perror("Could not rewind " NETDEVICES);
+                return result;
+        }
+
+        /* Clear glibc's buffer */
+        result = TEMP_FAILURE_RETRY(fflush(netdevices));
+        if (result) {
+                perror("Could not flush input stream");
+                return result;
+        }
+
+        /* Extract the I/O stats */
+        inpackets = outpackets = 0;
+        found_inpackets = found_outpackets = 0;
+        device_inpackets = device_outpackets = 0;
+        while (getline(&line, &len, netdevices) != -1 && errno != EINTR) {
+                ptr = line;
+                while (*ptr == ' ') ptr++; // Skip leading spaces
+                if (sscanf(ptr, "%s %*u %u %*u %*u %*u %*u %*u %*u %*u %u %*u %*u %*u %*u %*u %*u", device, &device_inpackets, &device_outpackets)) {
+                        if(strstr(device, "lo:")) continue; // Skip loopback interface
+                        found_inpackets++;
+                        found_outpackets++;
+                        inpackets += device_inpackets;
+                        outpackets += device_outpackets;
+                }
+
+        }
+        if (!found_inpackets || !found_outpackets) {
+                fprintf(stderr, "Could not find required lines in " NETDEVICES);
+                return -1;
+        }
+
+        /* Anything changed? */
+        result = (prev_inpackets  != inpackets) ||
+                 (prev_outpackets != outpackets);
+        prev_inpackets = inpackets;
+        prev_outpackets = outpackets;
+
+        return result;
+}
+
+/* Update the LED */
+void led(int on) 
+{
+	static int current = 1; /* Ensure the LED turns off on first call */
+	if (current == on)
+			return;
+
+	if (on) {
+			digitalWrite (o_gpiopin, HIGH);
+	} else {
+			digitalWrite (o_gpiopin, LOW);
+	}
+
+	current = on;
+}
+
+/* Signal handler -- break out of the main loop */
+//void shutdown(int sig) {
+        //running = 0;
+//}
+
+int SetStatusLED(int Red, int Green,int Blue)
+{
+	digitalWrite(redled, Red);
+	digitalWrite(grnled, Green);
+	digitalWrite(bluled, Blue);
+	return 0;
+}
+
+void PlayCaptureImageSound(void)
+{
+	//if(SoundIsEnabled == 0)
+	//	return;
+		
+	pwmSetRange(12);
+	pwmWrite(Piezo, 2);
+	sleep_ms(80);
+	pwmWrite(Piezo, 0);
+	pwmSetRange(10);
+	sleep_ms(50);
+	pwmWrite(Piezo, 2);
+	sleep_ms(300);
+	pwmWrite(Piezo, 0);
+}
+
+void PlayCaptureVideoStartSound(void)
+{
+	//if(SoundIsEnabled == 0)
+	//	return;
+		
+	pwmSetRange(12);
+	pwmWrite(Piezo, 2);
+	sleep_ms(300);
+	pwmWrite(Piezo, 0);
+}
+
+void PlayCaptureVideoStoppedSound(void)
+{
+	//if(SoundIsEnabled == 0)
+	//	return;
+	
+	pwmSetRange(12);
+	pwmWrite(Piezo, 2);
+	sleep_ms(100);
+	pwmWrite(Piezo, 0);
+	sleep_ms(250);
+	pwmWrite(Piezo, 2);
+	sleep_ms(100);
+	pwmWrite(Piezo, 0);
+}
+
+void PlayFailedSound(void)
+{
+	//if(SoundIsEnabled == 0)
+	//	return;
+		
+	pwmSetRange(10);
+	for(int ss = 0; ss < 9; ss++)
+	{
+		pwmWrite(Piezo, 2);
+		sleep_ms(50);
+		pwmWrite(Piezo, 0);
+		sleep_ms(100);
+	}
+}
+
+void PlaySystemStartedSound(void)
+{
+	//if(SoundIsEnabled == 0)
+	//	return;
+		
+	fprintf(stderr, "playing system startup sound\n");
+	pwmSetRange(12);
+	pwmWrite(Piezo, 2);
+	sleep_ms(100);
+	pwmWrite(Piezo, 0);
+	sleep_ms(250);
+	pwmWrite(Piezo, 2);
+	sleep_ms(100);
+	pwmWrite(Piezo, 0);
+	fprintf(stderr, "played system startup sound!\n");
+}
+
+void sleep_ms(int milliseconds)
+{
+	struct timespec ts;
+    ts.tv_sec = milliseconds / 1000;
+    ts.tv_nsec = (milliseconds % 1000) * 1000000;
+    nanosleep(&ts, NULL);
+}
+
+void ApplySettings(void)
+{
+	//Read the .Net config file and store remote host setting locally
+	FILE *sf;
+	char settingData[255];
+	sf = fopen("/boot/imageportsettings.config", "r");
+	if(sf == NULL)
+	{
+		fprintf(stderr, "Error opening settings file!");
+		exit(EXIT_FAILURE);
+	}
+	
+	//Constants to search for
+	const char RemoteHostString[20] = "RemoteHostAddress";
+	const char RemoteHostPort[20] = "RemoteHostPort";
+	const char SoundEnabled[20] = "SoundEnabled";
+	const char ImgLowTiming[20] = "ImageLowTiming";
+	const char ImgHighTiming[20] = "ImageHighTiming";
+	const char VidThreshold[22] = "VideoThresholdTiming";
+	const char ValueStr[10] = "value=\"";
+	const char ValueEndStr[10] = "\"/>";
+	
+	//Start and End pointers within settingData
+	char *valueStart;
+	char *valueEnd;
+	
+	int notEOF = 0;
+	do
+	{
+		//clear the array on each pass to prevent crap characters from appearing!
+		memset(settingData, 0, 255);
+		if(fgets(settingData, 255, sf) != NULL)
+		{
+			//Check line for RemoteHost setting
+			valueStart = strstr(settingData, RemoteHostString);
+			if(valueStart != NULL)
+			{
+				//found it so now get the location of value=
+				valueStart = strstr(settingData, ValueStr);
+				if(valueStart != NULL)
+				{
+					valueStart += 7;
+					//we now have the location of the start of value= now we need to find the location of />
+					valueEnd = strstr(settingData, ValueEndStr);
+					if(valueEnd != NULL)
+					{
+						int strLength;
+						strLength = valueEnd - valueStart;
+						strncpy(settingRemoteHost, valueStart, strLength);
+						settingRemoteHost[strLength] = 0;
+						fprintf(stderr, "Setting Remote Host: %s\n", settingRemoteHost);
+					}
+					else
+					{
+						fprintf(stderr, "Remote Host Setting NULL\n");
+					}
+				}
+			}
+			
+			valueStart = strstr(settingData, RemoteHostPort);
+			if(valueStart != NULL)
+			{
+				//found it so now get the location of value=
+				valueStart = strstr(settingData, ValueStr);
+				if(valueStart != NULL)
+				{
+					valueStart += 7;
+					//we now have the location of the start of value= now we need to find the location of />
+					valueEnd = strstr(settingData, ValueEndStr);
+					if(valueEnd != NULL)
+					{
+						int strLength;
+						strLength = valueEnd - valueStart;
+						strncpy(settingRemoteHostPort, valueStart, strLength);
+						settingRemoteHostPort[strLength] = 0;
+						fprintf(stderr, "Setting Remote Host Port: %s\n", settingRemoteHostPort);
+					}
+					else
+					{
+						fprintf(stderr, "Remote port Setting NULL\n");
+					}
+				}
+			}
+			
+			valueStart = strstr(settingData, SoundEnabled);
+			if(valueStart != NULL)
+			{
+				//found it so now get the location of value=
+				valueStart = strstr(settingData, ValueStr);
+				if(valueStart != NULL)
+				{
+					valueStart += 7;
+					//we now have the location of the start of value= now we need to find the location of />
+					valueEnd = strstr(settingData, ValueEndStr);
+					if(valueEnd != NULL)
+					{
+						int strLength;
+						strLength = valueEnd - valueStart;
+						strncpy(settingSoundEnabled, valueStart, strLength);
+						settingSoundEnabled[strLength] = 0;
+						fprintf(stderr, "Setting Sound Enabled: %s\n", settingSoundEnabled);
+					}
+					else
+					{
+						fprintf(stderr, "Sound Enabled Setting NULL\n");
+					}
+				}
+				
+			}
+			
+			//Trigger Timing Settings
+			//Image Minimum button hold value
+			valueStart = strstr(settingData, ImgLowTiming);
+			if(valueStart != NULL)
+			{
+				//found it so now get the location of value=
+				valueStart = strstr(settingData, ValueStr);
+				if(valueStart != NULL)
+				{
+					valueStart += 7;
+					//we now have the location of the start of value= now we need to find the location of />
+					valueEnd = strstr(settingData, ValueEndStr);
+					if(valueEnd != NULL)
+					{
+						int strLength;
+						strLength = valueEnd - valueStart;
+						strncpy(settingImageLowTiming, valueStart, strLength);
+						settingImageLowTiming[strLength] = 0;
+						fprintf(stderr, "Setting Image Low Timing to: %s\n", settingImageLowTiming);
+					}
+					else
+					{
+						fprintf(stderr, "Image Low Timing Setting NULL\n");
+					}
+				}
+			}
+			
+			//Image maximum button hold value
+			valueStart = strstr(settingData, ImgHighTiming);
+			if(valueStart != NULL)
+			{
+				//found it so now get the location of value=
+				valueStart = strstr(settingData, ValueStr);
+				if(valueStart != NULL)
+				{
+					valueStart += 7;
+					//we now have the location of the start of value= now we need to find the location of />
+					valueEnd = strstr(settingData, ValueEndStr);
+					if(valueEnd != NULL)
+					{
+						int strLength;
+						strLength = valueEnd - valueStart;
+						strncpy(settingImageHighTiming, valueStart, strLength);
+						settingImageHighTiming[strLength] = 0;
+						fprintf(stderr, "Setting Image High Timing to: %s\n", settingImageHighTiming);
+					}
+					else
+					{
+						fprintf(stderr, "Image High Timing Setting NULL\n");
+					}
+				}
+			}
+			
+			//Video button hold threshold
+			valueStart = strstr(settingData, VidThreshold);
+			if(valueStart != NULL)
+			{
+				//found it so now get the location of value=
+				valueStart = strstr(settingData, ValueStr);
+				if(valueStart != NULL)
+				{
+					valueStart += 7;
+					//we now have the location of the start of value= now we need to find the location of />
+					valueEnd = strstr(settingData, ValueEndStr);
+					if(valueEnd != NULL)
+					{
+						int strLength;
+						strLength = valueEnd - valueStart;
+						strncpy(settingVideoThresholdTiming, valueStart, strLength);
+						settingVideoThresholdTiming[strLength] = 0;
+						fprintf(stderr, "Setting Video Threshold Timing to: %s\n", settingVideoThresholdTiming);
+					} 
+					else
+					{
+						fprintf(stderr, "Video Threshold Timing Setting NULL\n");
+					}
+				}
+			}
+			
+			//End Of Settings Loop
+		}
+		else
+		{
+			notEOF = 1;
+		}
+	} while(notEOF == 0);
+	
+	//Now convert text to integers for certain settings
+	IsSoundEnabled();
+	GetImgLowTiming();
+	GetImgHighTiming();
+	GetVideoThresholdTiming();
+}
+
+void IsSoundEnabled(void)
+{
+	//Check string settingSoundEnabled for a true or True and then return 1 if it is else 0
+	int rtnVal = 0;
+	const char trueText[6] = "true";
+	const char trueText2[6] = "True";
+	
+	char* strLoc = strstr(settingSoundEnabled, trueText);
+	char* strLoc2 = strstr(settingSoundEnabled, trueText2);
+	
+	//printf("Search for true is: %s\n", strLoc);
+	//printf("Search for True is: %s\n", strLoc2);
+	
+	if(strLoc != NULL)
+		rtnVal = 1;
+		
+	if(strLoc2 != NULL)
+		rtnVal = 1;
+	
+	SoundIsEnabled = rtnVal;
+	
+	//printf("Sound is enabled set to %d\n", rtnVal);
+	
+	return;
+}
+
+void GetImgLowTiming(void)
+{
+	ImageLowTiming = strtol(settingImageLowTiming, NULL, 10);
+	
+	fprintf(stderr, "ImageLowTiming: %d\n", ImageLowTiming);
+	
+	return;
+}
+
+void GetImgHighTiming(void)
+{
+	ImageHighTiming = strtol(settingImageHighTiming, NULL, 10);
+	
+	fprintf(stderr, "ImageHighTiming: %d\n", ImageHighTiming);
+	
+	return;
+}
+
+void GetVideoThresholdTiming(void)
+{
+	VideoThresholdTiming = strtol(settingVideoThresholdTiming, NULL, 10);
+
+	fprintf(stderr, "VideoThresholdTiming: %d\n", VideoThresholdTiming);
+	
+	return;
+}
+
+void ResetSettings(void)
+{
+	//Change LED to Orange so we know something is going on
+	digitalWrite(redled, 0);
+	digitalWrite(bluled, 1);
+	digitalWrite(grnled, 0);
+	
+	//Copy default factory settings files to current imageport settings file
+	if(WEXITSTATUS(system("sudo cp /boot/factorysettings.config /boot/imageportsettings.config")) != -1)
+	{
+		sleep_ms(2000);
+		system("sudo sync");
+		sleep_ms(2000);
+		system("sudo reboot now");
+		exit(EXIT_SUCCESS);
+	} else
+	{
+		PlayFailedSound();
+		//Set FAULT LED ON
+	}
+}
+
+void CreateGUID()
+{
+	uuid_generate(uuid);
+	char uuid_str[37];
+	uuid_unparse(uuid, uuid_str);
+	strcpy(thisGUID, uuid_str);
+	fprintf(stderr, "GUID: %s\n", thisGUID);
+	
+	return;
+}
+
+unsigned long fsize(char* file)
+{
+    FILE * f = fopen(file, "r");
+    fseek(f, 0, SEEK_END);
+    unsigned long len = (unsigned long)ftell(f);
+    fclose(f);
+    return len;
+}
+
+void CheckLanesReady()
+{
+	//For some reason HDMI sets the lanes required to 3 when it should be 2, calling the EDID and timing set query resolves this, but can take a couple of tries hence the following code!
+	int SysReady = 0;
+	FILE *fpfp;
+	char fppath[1035];
+	const char LanesString[16] = "Lanes needed: 2";
+	char *LanesStart;
+	int LaneCheckCounter = 0;
+	
+	do
+	{		
+		//Now check they have been applied, this can take a variable amount of time
+		fpfp = popen("sudo v4l2-ctl --log-status | sudo grep Lanes", "r");
+		if(fpfp == NULL) {
+			fprintf(stderr, "Failed to run command\n");
+			//exit(1);
+		}
+		
+		while (fgets(fppath, sizeof(fppath)-1, fpfp) != NULL) 
+		{
+			printf("%s", fppath);
+			
+			LanesStart = strstr(fppath, LanesString);
+			if(LanesStart != NULL)
+				SysReady = 1;
+		}
+		
+		pclose(fpfp);
+		
+		LaneCheckCounter++;
+		
+		if(LaneCheckCounter > 3)
+		{
+			//A problem, we either have no HDMI input or there really is a serious issue, so beep and show red as RGB status
+			//Set failed status
+			digitalWrite(redled, 1);
+			digitalWrite(grnled, 0);
+			digitalWrite(bluled, 0);
+			PlayFailedSound();
+			LaneCheckCounter = 0;
+		}
+		
+		//NOT DOING THIS NEXT PART FOR THE MOMENT AS IT BREAKS THE MMAL SETUP PHASE
+		
+		//Set HDMI Parameters
+		//system("v4l2-ctl --set-edid=file=/home/pi/ImagePortMonitorService/1080P50EDID.txt --fix-edid-checksums");
+		//sleep_ms(200);
+		//system("v4l2-ctl --set-dv-bt-timings index=11");
+		//sleep_ms(200);
+		//system("v4l2-ctl --device /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=UYVY");
+		//sleep_ms(200);
+	} while(SysReady != 1);
+}
+
+
+int MoveFiles(void)
+{
+	int retSysCall = -1;
+	
+	retSysCall = WEXITSTATUS(system("sudo rm /ramdisk/*.jpg_*"));
+	fprintf(stderr, "\nMove Files Return Code: %d\n", retSysCall);
+	
+	retSysCall = WEXITSTATUS(system("sudo rm /ramdisk/*.pts"));	
+	fprintf(stderr, "\nDelete pts Files Return Code: %d\n", retSysCall);
+	
+	//Check the ramdisk has no open files...
+	do
+	{
+		retSysCall = WEXITSTATUS(system("sudo lsof -e /run/user/1000/gvfs +D /ramdisk"));
+	} while(retSysCall != 1);
+	
+	//Copy to mount point, needs to be loaded!!!!
+	//Loop until rsync passes, we know the file has been finished with so shouldn't ever copy a zero byte file, famous last words!!
+	int aexit = 0;
+	do
+	{	
+		fprintf(stderr, "Checking first start so we can clear 0 byte init capture...\n");
+		if(applicationStart == 0)
+		{
+			system("sudo rm /ramdisk/*.jpg");
+			applicationStart = 1;
+			aexit = 1;
+		}
+		
+		fprintf(stderr, "RSYNC RUNNING");
+		//There are files to process, first sync files and remove source files that have copied
+		//system("sudo rsync -r --progress --remove-source-files /media/usb/ /mnt/paceport_38e202 --exclude=\"HDClinicalPacePort\" --exclude=\"System Volume Information\"");
+		aexit = WEXITSTATUS(system(settingPPRSYNC));
+		
+		fprintf(stderr, "Return Code: %d\n", aexit);
+	} while(aexit != 0);
+	
+	return retSysCall;
+}
+
+void readStorageSettings(void)
+{
+	//Load Mount settings
+	FILE *fileMount;
+	FILE *fileRsync;
+	FILE *fileFind;
+	
+	fileMount = fopen("/boot/ppmount.dat","r");
+	fileRsync = fopen("/boot/pprsync.dat","r");
+	fileFind = fopen("/boot/ppfind.dat","r");
+	
+	if(fileMount == NULL || fileRsync == NULL || fileFind == NULL)
+		exit(EXIT_FAILURE);
+	else
+	{
+		if(fgets(settingPPMount, 255, fileMount) != NULL)
+			if(fgets(settingPPRSYNC, 255, fileRsync) != NULL)
+				if(fgets(settingPPFIND, 255, fileFind) == NULL)
+				{
+					exit(EXIT_FAILURE);
+				}
+	}
+	
+	fclose(fileMount);
+	fclose(fileRsync);
+	fclose(fileFind);
+	
+	fprintf(stderr, settingPPMount);
+	fprintf(stderr, "\n");
+	fprintf(stderr, settingPPRSYNC);
+	fprintf(stderr, "\n");
+	fprintf(stderr, settingPPFIND);
+	fprintf(stderr, "\n");
+}
+
+int CheckMount(void)
+{
+	int FoundMount = 0;
+	
+	while(FoundMount != 1)
+	{
+		sleep_ms(4000);
+		
+		//system("sudo mount -t cifs -o username=pi,password=raspberry //192.168.2.20/PacePortShare /mnt");
+		system(settingPPMount);
+	
+		//Try to open /mnt/HDClinicalPacePort.txt file on success close it and set FoundMount = 1
+		FILE *mountFile;
+		mountFile = fopen("/mnt/HDClinicalImagePort.txt","rb");
+		if(mountFile != NULL)
+		{
+			char datainFile[255];
+			
+			if(fgets(datainFile, 255, mountFile) != NULL)
+				FoundMount = 1;
+			fclose(mountFile);
+		} else
+		{
+			fprintf(stderr, "HDC Check File failed!");
+		}
+	}
+	return 0;
+}
+
+int CaptureImage(void)
+{
+	//Change LED to purple to show busy capturing
+	digitalWrite(redled, 0);
+	digitalWrite(grnled, 1);
+	digitalWrite(bluled, 0);
+	
+	//Generate FileName UUID and Sequence Numbers
+	CreateGUID();
+	char image_filename[255];
+	char extension[4] = ".jpg";
+	char SequenceText[16];
+	sprintf(SequenceText, "%Ld", SequenceNumber);
+	
+	strncat(image_filename, "UNI", 3);
+	strncat(image_filename, thisGUID, 37);
+	strncat(image_filename, "--", 2);
+	strncat(image_filename, SequenceText, 16);
+	strncat(image_filename, extension, 4);
+	
+	//Set lastfilename for diag check
+	strcpy(lastfilename, "\0");
+	strcpy(lastfilename, "/ramdisk/");
+	strncat(lastfilename, "UNI", 3);
+	strncat(lastfilename, thisGUID, 37);
+	strncat(lastfilename, "--", 2);
+	strncat(lastfilename, SequenceText, 16);
+	strncat(lastfilename, extension, 4);
+	
+	fprintf(stderr, "%s\n", image_filename);
+	fprintf(stderr, "%s\n", lastfilename);
+	
+	//Set trigger to 1 to initiate a capture in the save_image_thread function
+	trigger = 1;
+	
+	//Now wait for CapFrameDone to change
+	do
+	{
+		sleep_ms(1);
+	} while(CapFrameDone == 0);
+	
+	SequenceNumber++;
+	if(CapFrameDone == 2)
+	{
+		fprintf(stderr, "Failed to capture image!\n");
+		//Set failed status
+		digitalWrite(redled, 0);
+		digitalWrite(grnled, 1);
+		digitalWrite(bluled, 1);
+		PlayFailedSound();
+		sleep_ms(100);
+		CapFrameDone = 0;	//Reset flag so we know we can take another capture if we want
+		return -1;
+	}
+	if(CapFrameDone == 1)
+	{
+		fprintf(stderr, "Completed Image Capture!\n");
+		//Set to success status
+		digitalWrite(redled, 1);
+		digitalWrite(grnled, 0);
+		digitalWrite(bluled, 1);
+		PlayCaptureImageSound();
+		sleep_ms(100);
+		CapFrameDone = 0;	//Reset flag so we know we can take another capture if we want
+		return 0;
+	}
+	
+	return 0;				//Won't ever get here but as the compiler complains we'll add it in...
+}
+
+int CaptureVideo(void)
+{
+	//This is not yet been worked on to produce a video file, so disabling it for now to avoid confusion later on! DJR 06072020
+	return -1;
+}
+
+//Wait on Trigger and file move thread
+static int startClientDone;
+void* WaitOnTrigger(void* arg)
+{
+	do
+	{
+		//Start RTSPClient once we know it's ok to do so, using flag "StartLocalRTSPClient == 1"
+		//if(StartLocalRTSPClient == 1 && startClientDone == 0)
+		//{
+			//startClientDone = 1;
+			//if(fork() == 0)
+			//{
+				//restart:
+					//execl("/home/pi/live/testProgs/testRTSPClient", "RTSPClient", "rtsp://127.0.0.1:8554/h264", (char*) NULL);
+					//sleep_ms(1000);
+					//goto restart;
+				
+			//}
+		//}
+		
+		//Network Activity LED
+		//int a;
+		// leave commented out //if (nanosleep(&delay, NULL) < 0)
+		// leave commented out //		break;
+		//a = activity(netdevices);
+		//if (a < 0)
+		//		break;
+		//led(a);
+		
+		if(waitRelease == 1)
+		{
+			if(digitalRead(2) == triggerLevel)
+			{
+				waitRelease = 0;
+				//Set to blue idle mode
+				digitalWrite(redled, 1);
+				digitalWrite(grnled, 1);
+				digitalWrite(bluled, 0);
+			}
+		}
+			
+		if(digitalRead(2) != triggerLevel && waitRelease != 1)
+		{
+			timing++;
+			//fprintf(stderr, "Input signal detected: %d\n", timing);
+			if(timing > ImageLowTiming)// && timing < ImageHighTiming)
+			{
+				CapType = 1;	//Image
+				waitRelease = 1;
+			}
+		}
+		else
+		{
+			if(CapType == 0)
+			{
+				if(timing > ImageLowTiming)// && timing < ImageHighTiming)
+				{
+					CapType = 1;	//Image
+					waitRelease = 1;
+				}
+				//if(timing > VideoThresholdTiming)
+				//{
+				//	CapType = 2;	//Video
+				//	//timing = 0;
+				//	waitRelease = 1;
+				//}
+			} 
+		}
+		
+		sleep_ms(1);		//Used to debounce the switch so it doesn't just always take a single capture but allows the hold for video to work too!
+		//Do Not add debug here or it'll throw off the button timings totally!!
+				
+		if(CapType == 1)	//Single frame capture
+		{			
+			//fprintf(stderr, "timing: %d\n", timing);
+			//fprintf(stderr, "CapType: %d\n", CapType);
+			CapType = 0;
+			timing = 0;
+			if(CaptureImage() == -1)
+			{
+				sleep_ms(10);
+			}
+			
+			MoveFiles();
+			
+			//Set to blue idle mode
+			digitalWrite(redled, 1);
+			digitalWrite(grnled, 1);
+			digitalWrite(bluled, 0);
+		}
+		
+		if(CapType == 2)	//Video start recording - Not Yet Implemented!
+		{			
+			//fprintf(stderr, "timing: %d\n", timing);
+			//fprintf(stderr, "CapType: %d\n", CapType);
+			CapType = 0;
+			timing = 0;
+			if(CaptureImage() == -1)
+			{
+				sleep_ms(10);
+			}
+			
+			MoveFiles();
+			
+			//Set to blue idle mode
+			digitalWrite(redled, 1);
+			digitalWrite(grnled, 1);
+			digitalWrite(bluled, 0);
+		}
+		
+	} while(1 == 1);
+	return 0;
+}
+
+//End Of Original ImagePort Functions
 
 enum buffer_fill_mode
 {
@@ -1690,10 +2650,10 @@ static void isp_ip_cb(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
 {
 	struct device *dev = (struct device *)port->userdata;
 	unsigned int i;
-//	fprintf(stderr, "Buffer %p (->data %p) returned\n", buffer, buffer->data);
+	fprintf(stderr, "Buffer %p (->data %p) returned\n", buffer, buffer->data);
 	for (i = 0; i < dev->nbufs; i++) {
 		if (dev->buffers[i].mmal == buffer) {
-//			fprintf(stderr, "Matches V4L2 buffer index %d / %d\n", i, dev->buffers[i].idx);
+			fprintf(stderr, "Matches V4L2 buffer index %d / %d\n", i, dev->buffers[i].idx);
 			video_queue_buffer(dev, dev->buffers[i].idx, BUFFER_FILL_NONE);
 			mmal_buffer_header_release(buffer);
 			buffer = NULL;
@@ -1713,13 +2673,18 @@ static void * save_thread(void *arg)
 	MMAL_STATUS_T status;
 	unsigned int bytes_written;
 
+	fprintf(stderr, "save_thread called\n");
+
 	while (!dev->thread_quit)
 	{
 		//Being lazy and using a timed wait instead of setting up a
 		//mechanism for skipping this when destroying the thread
 		buffer = mmal_queue_timedwait(dev->save_queue, 500);
 		if (!buffer)
+		{
+			fprintf(stderr, "**** Timed wait in save_thread timed out without a buffer!\n");
 			continue;
+		}
 
 		//fprintf(stderr, "Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
 		if (dev->h264_fd)
@@ -1751,8 +2716,6 @@ static void * save_thread(void *arg)
 	return NULL;
 }
 
-static int lockout = 0;
-static int countdown = 100;
 static void * save_image_thread(void *arg)
 {
 	struct device *dev = (struct device *)arg;
@@ -1760,45 +2723,68 @@ static void * save_image_thread(void *arg)
 	MMAL_STATUS_T status;
 	unsigned int bytes_written;
 
+	fprintf(stderr, "save_image_thread called\n");
+
 	while (!dev->thread_quit)
 	{
 		//Being lazy and using a timed wait instead of setting up a
 		//mechanism for skipping this when destroying the thread
-		buffer = mmal_queue_timedwait(dev->save_image_queue, 500);		//v4l2_mmal has this set to 100, maybe try a lower value once working - DJR
+		buffer = mmal_queue_timedwait(dev->save_image_queue, 500);		//v4l2_mmal has this set to 100, maybe try different values?!?!?
 		if (!buffer)
-			continue;
-
-		fprintf(stderr, "Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
-		//This needs to check the gpio pin!! - DJR
-		if(lockout == 0 && countdown == 0)
 		{
+			fprintf(stderr, "**** Timed wait in save_image_thread timed out without a buffer!\n");
+			continue;
+		}
+
+		//We have frames so start the local RTSP Client so there's something consuming the stream and it doesn't lock up the capture ability.
+		if(StartLocalRTSPClient == 0)
+			StartLocalRTSPClient = 1;
+
+		//fprintf(stderr, "Buffer %p saving, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
+		if(lockout == 0 && trigger == 1)
+		{	
 			lockout = 1;
 			fprintf(stderr, "writing image file\n");
-			if (!dev->image_fd)
+			//if (!dev->image_fd)
+			if(1 == 1)
 			{
-				dev->image_fd = fopen("/ramdisk/tempimg.jpg", "wb");
+				char fname[255];
+				strcpy(fname, "/ramdisk/UNI");
+				strncat(fname, thisGUID, 37);
+				strncat(fname, "-", 1);
+				char SequenceText[16];
+				sprintf(SequenceText, "%Ld", SequenceNumber);
+				strncat(fname, SequenceText, 16);
+				strncat(fname, ".jpg", 4);
+				fprintf(stderr, fname);
+				
+				dev->image_fd = fopen(fname, "wb");
 				bytes_written = fwrite(buffer->data, 1, buffer->length, dev->image_fd);
 				fflush(dev->image_fd);
 				fclose(dev->image_fd);
 				if (bytes_written != buffer->length)
 				{
 					fprintf(stderr, "Failed to write image buffer data (%d from %d)- aborting", bytes_written, buffer->length);
+					CapFrameDone = 2;
 				} else
 				{
-					//start a thread to copy over the image file - DJR
 					fprintf(stderr, "written image file (%d from %d)\n", bytes_written, buffer->length);
+					CapFrameDone = 1;
 				}
+				lockout = 0;
+				trigger = 0;
+			} else
+			{
+				//File still open so don't do anything
+				fprintf(stderr, "Image Output File Open Already, not Writing anything!\n");
+				CapFrameDone = 2;
 			}
-		} else
-		{
-			fprintf(stderr, "Countdown: %d", countdown);
-			countdown--;
 		}
 		
-		if (dev->pts_fd &&
-		    !(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG) &&
-		    buffer->pts != MMAL_TIME_UNKNOWN)
+		if (dev->pts_fd && !(buffer->flags & MMAL_BUFFER_HEADER_FLAG_CONFIG) && buffer->pts != MMAL_TIME_UNKNOWN)
+		{
 			fprintf(dev->pts_fd, "%lld.%03lld\n", buffer->pts/1000, buffer->pts%1000);
+		}
 
 		buffer->length = 0;
 		status = mmal_port_send_buffer(dev->iencoder->output[0], buffer);
@@ -1814,7 +2800,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 {
 	struct device *dev = (struct device *)port->userdata;
 
-	//fprintf(stderr, "Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
+	fprintf(stderr, "Video Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
 	//vcos_log_error("File handle: %p", port->userdata);
 
 	if (port->is_enabled)
@@ -1827,7 +2813,7 @@ static void image_encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_
 {
 	struct device *dev = (struct device *)port->userdata;
 	
-	//fprintf(stderr, "Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
+	fprintf(stderr, "Image Buffer %p returned, filled %d, timestamp %llu, flags %04X\n", buffer, buffer->length, buffer->pts, buffer->flags);
 	//vcos_log_error("File handle: %p", port->userdata);
 
 	if (port->is_enabled)
@@ -1969,7 +2955,7 @@ static void handle_event(struct device *dev)
             case V4L2_EVENT_SOURCE_CHANGE:
                 fprintf(stderr, "Source changed\n");
 
-		video_set_dv_timings(dev);
+				video_set_dv_timings(dev);
 //                stop_capture(V4L2_BUF_TYPE_VIDEO_CAPTURE);
 //                unmap_buffers(buffers, n_buffers);
 
@@ -2059,6 +3045,8 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		fprintf(stderr, "Unsupported encoding\n");
 		return -1;
 	}
+	//port->format->encoding = info->mmal_encoding;
+	//port->format->encoding_variant = MMAL_ENCODING_I420;
 	port->format->encoding = info->mmal_encoding;
 	port->format->es->video.crop.width = fmt.fmt.pix.width;
 	port->format->es->video.crop.height = fmt.fmt.pix.height;
@@ -2067,8 +3055,8 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 	/* FIXME - buffer may not be aligned vertically */
 	port->format->es->video.height = (fmt.fmt.pix.height+15) & ~15;	
 	//Ignore for now, but will be wanted for video encode.
-	//port->format->es->video.frame_rate.num = 10000;
-	//port->format->es->video.frame_rate.den = frame_interval ? frame_interval : 10000;
+	port->format->es->video.frame_rate.num = 0;			//was 10000 and disabled
+	port->format->es->video.frame_rate.den = 1; 		//frame_interval ? frame_interval : 10000;
 	port->buffer_num = nbufs;
 	if (dev->fps) {
 		dev->frame_time_usec = 1000000/dev->fps;
@@ -2123,7 +3111,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 	if (dev->render)
 	{
 		status = mmal_format_full_copy(dev->render->input[0]->format, isp_output->format);
-		dev->render->input[0]->buffer_num = 3;
+		dev->render->input[0]->buffer_num = 8;
 		if (status == MMAL_SUCCESS)
 			status = mmal_port_format_commit(dev->render->input[0]);
 	}
@@ -2132,7 +3120,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 	if (dev->iencoder)
 	{
 		status = mmal_format_full_copy(image_encoder_input->format, isp_output->format);
-		image_encoder_input->buffer_num = 3;
+		image_encoder_input->buffer_num = 8;
 		if (status == MMAL_SUCCESS)
 			status = mmal_port_format_commit(image_encoder_input);
 		if (status != MMAL_SUCCESS)
@@ -2146,7 +3134,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 	   if (image_encoder_output->buffer_size < image_encoder_output->buffer_size_min)
 		  image_encoder_output->buffer_size = image_encoder_output->buffer_size_min;
 
-	   image_encoder_output->buffer_num = image_encoder_output->buffer_num_recommended;
+	   image_encoder_output->buffer_num = encoder_output->buffer_num = 8; //image_encoder_output->buffer_num_recommended;
 	   //encoder_output->buffer_num = 3;
 
 	   if (image_encoder_output->buffer_num < image_encoder_output->buffer_num_min)
@@ -2194,26 +3182,27 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			return -1;
 		}
 		image_encoder_input->userdata = (struct MMAL_PORT_USERDATA_T *)dev;
+		fprintf(stderr, "Finished Image Encoder Configuration!\n");
 	}
 
 	//  Video Encoder setup
 	if (dev->encoder)
 	{
 		status = mmal_format_full_copy(encoder_input->format, isp_output->format);
-		encoder_input->buffer_num = 3;
+		encoder_input->buffer_num = 8;
 		if (status == MMAL_SUCCESS)
 			status = mmal_port_format_commit(encoder_input);
 
 		// Only supporting H264 at the moment
 		encoder_output->format->encoding = MMAL_ENCODING_H264;
 
-		encoder_output->format->bitrate = 10000000;
-		encoder_output->buffer_size = 256<<10;//encoder_output->buffer_size_recommended;
+		encoder_output->format->bitrate = 17000000; //MAX_BITRATE_LEVEL42;							//was 10Mbps which is way too low, 62.5Mbps is the correct value
+		encoder_output->buffer_size = 256<<10;		//encoder_output->buffer_size_recommended;			//was 256<<10;
 
 		if (encoder_output->buffer_size < encoder_output->buffer_size_min)
 			encoder_output->buffer_size = encoder_output->buffer_size_min;
 
-		encoder_output->buffer_num = 8; //encoder_output->buffer_num_recommended;
+		encoder_output->buffer_num = 8; //encoder_output->buffer_num_recommended;		//was 8
 
 		if (encoder_output->buffer_num < encoder_output->buffer_num_min)
 			encoder_output->buffer_num = encoder_output->buffer_num_min;
@@ -2271,20 +3260,12 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			fprintf(stderr, "Unable to set format on video encoder input port\n");
 		}
 
-		fprintf(stderr, "Enable encoder....\n");
+		fprintf(stderr, "Enabling video encoder....\n");
 		status = mmal_component_enable(dev->encoder);
 		if(status != MMAL_SUCCESS)
 		{
 			fprintf(stderr, "Failed to enable\n");
-			return -1;status = mmal_component_create("vc.ril.image_encode", &dev->iencoder);
-		if(status != MMAL_SUCCESS)
-		{
-			fprintf(stderr, "Failed to create image encoder\n");
-		} else
-		{
-			image_encoder_input = dev->iencoder->input[0];
-			image_encoder_output = dev->iencoder->output[0];
-		}
+			return -1;
 		}
 		status = mmal_port_parameter_set_boolean(encoder_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
 		status += mmal_port_parameter_set_boolean(encoder_input, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
@@ -2294,6 +3275,7 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			return -1;
 		}
 		encoder_input->userdata = (struct MMAL_PORT_USERDATA_T *)dev;
+		fprintf(stderr, "Finished setting up video encoder configuration\n");
 	}
 
 	status = mmal_port_parameter_set_boolean(isp_output, MMAL_PARAMETER_ZERO_COPY, MMAL_TRUE);
@@ -2379,7 +3361,22 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			fprintf(stderr, "Failed to create image encoder output pool\n");
 			return -1;
 		}
-		//Save queue is setup by the video encoder further down
+		
+		dev->save_image_queue = mmal_queue_create();
+		if(!dev->save_image_queue)
+		{
+			fprintf(stderr, "Failed to create image queue\n");
+			return -1;
+		}
+		
+		//Save image save thread
+		vcos_status = vcos_thread_create(&dev->save_image_thread, "image-thread", NULL, save_image_thread, dev);
+		if(vcos_status != VCOS_SUCCESS)
+		{
+			fprintf(stderr, "Failed to create image save thread\n");
+			return -1;
+		}
+		
 		//Enable the output port and send it the queue of buffers
 		status = mmal_port_enable(image_encoder_output, image_encoder_buffer_callback);
 		if(status != MMAL_SUCCESS)
@@ -2446,13 +3443,6 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 			fprintf(stderr, "Failed to create video queue\n");
 			return -1;
 		}
-		
-		dev->save_image_queue = mmal_queue_create();
-		if(!dev->save_image_queue)
-		{
-			fprintf(stderr, "Failed to create image queue\n");
-			return -1;
-		}
 
 		//Save video save thread
 		vcos_status = vcos_thread_create(&dev->save_thread, "save-thread",
@@ -2460,14 +3450,6 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		if(vcos_status != VCOS_SUCCESS)
 		{
 			fprintf(stderr, "Failed to create video save thread\n");
-			return -1;
-		}
-
-		//Save image save thread
-		vcos_status = vcos_thread_create(&dev->save_image_thread, "image-thread", NULL, save_image_thread, dev);
-		if(vcos_status != VCOS_SUCCESS)
-		{
-			fprintf(stderr, "Failed to create image save thread\n");
 			return -1;
 		}
 
@@ -2498,6 +3480,10 @@ static int setup_mmal(struct device *dev, int nbufs, int do_encode, const char *
 		}
 	}
 
+	//If everything passed, which it did as we got here, then start the trigger and move file thread
+	PlaySystemStartedSound();
+	pthread_create(&ptid, NULL, &WaitOnTrigger, NULL);
+	startClientDone = 0;
 	return 0;
 }
 
@@ -2524,6 +3510,8 @@ static void destroy_mmal(struct device *dev)
 	//FIXME: Clean up everything properly
 	dev->thread_quit = 1;
 	vcos_thread_join(&dev->save_thread, NULL);
+	pthread_join(ptid, NULL);
+	pthread_exit(NULL);
 }
 
 static void video_save_image(struct device *dev, struct v4l2_buffer *buf,
@@ -2536,6 +3524,8 @@ static void video_save_image(struct device *dev, struct v4l2_buffer *buf,
 	bool append;
 	int ret = 0;
 	int fd;
+
+	fprintf(stderr, "video_save_image called\n");
 
 	size = strlen(pattern);
 	filename = malloc(size + 12);
@@ -2628,7 +3618,9 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 	last.tv_sec = start.tv_sec;
 	last.tv_usec = start.tv_nsec / 1000;
 
-        while (i < nframes) {
+        //while (i < nframes) 
+        while(1)
+        {
                 fd_set fds[3];
                 fd_set *rd_fds = &fds[0]; /* for capture */
                 fd_set *ex_fds = &fds[1]; /* for capture */
@@ -2636,24 +3628,30 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
                 struct timeval tv;
                 int r;
 
-                if (rd_fds) {
+                if (rd_fds) 
+                {
                     FD_ZERO(rd_fds);
                     FD_SET(dev->fd, rd_fds);
+                    //fprintf(stderr, "rd_fds\n");
                 }
 
-                if (ex_fds) {
+                if (ex_fds) 
+                {
                     FD_ZERO(ex_fds);
                     FD_SET(dev->fd, ex_fds);
+                    //fprintf(stderr, "ex_fds\n");
                 }
 
-                if (wr_fds) {
+                if (wr_fds) 
+                {
                     FD_ZERO(wr_fds);
                     FD_SET(dev->fd, wr_fds);
+                    //fprintf(stderr, "wr_fds\n");
                 }
 
                 /* Timeout. */
-                tv.tv_sec = 10;
-                tv.tv_usec = 0;
+                tv.tv_sec = 10;			//was 10
+                tv.tv_usec = 0;			//was 0
 
 				//Stops here after two buffers are processed but only after adding the image_encode component, why??
                 r = select(dev->fd + 1, rd_fds, wr_fds, ex_fds, &tv);
@@ -2666,6 +3664,9 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 
                 if (0 == r) {
                         fprintf(stderr, "select timeout\n");
+                        fprintf(stderr, "rd_fds %d\n", FD_ISSET(dev->fd, rd_fds));
+                        fprintf(stderr, "wr_fds %d\n", FD_ISSET(dev->fd, wr_fds));
+                        fprintf(stderr, "ex_fds %d\n", FD_ISSET(dev->fd, ex_fds));
                         exit(EXIT_FAILURE);
                 }
 
@@ -2750,7 +3751,8 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 							timersub(&buf.timestamp, &dev->starttime, &pts);
 							//MMAL PTS is in usecs, so convert from struct timeval
 							mmal->pts = (pts.tv_sec * 1000000) + pts.tv_usec;
-							if (mmal->pts > (dev->lastpts+dev->frame_time_usec+1000)) {
+							if (mmal->pts > (dev->lastpts+dev->frame_time_usec+1000)) 
+							{
 								fprintf(stderr, "DROPPED FRAME - %lld and %lld, delta %lld\n", dev->lastpts, mmal->pts, mmal->pts-dev->lastpts);
 								dropped_frames++;
 							}
@@ -2778,7 +3780,7 @@ static int video_do_capture(struct device *dev, unsigned int nframes,
 					if (i >= nframes - dev->nbufs && !do_requeue_last)
 					{
 						//fprintf(stderr, "Continue 1\n");
-						continue;
+						//continue;
 					}
 					if (!queue_buffer)
 					{
@@ -2896,7 +3898,7 @@ int video_get_fps(struct device *dev)
 		fprintf(stderr, "Unable to get frame rate: %s (%d).\n",
 			strerror(errno), errno);
 		/* Make a wild guess at the frame rate */
-		dev->fps = 15;
+		dev->fps = 15;		//was 15, but we know we're giving 50fps at HDMI, may need overriding for CVBS...
 		return ret;
 	}
 
@@ -3021,8 +4023,130 @@ static struct option opts[] = {
 	{0, 0, 0, 0}
 };
 
+void setupgpio()
+{
+	fprintf(stderr, "Starting ImagePort Monitor Service...\n");
+	
+	//Setup External LED network activity driver
+	delay2.tv_sec = o_refresh / 1000;
+	delay2.tv_nsec = 1000000 * (o_refresh % 1000);
+	netdevices = fopen(NETDEVICES, "r");
+	led(LOW);
+	activity(netdevices);
+	
+	//Setup the ramdisk, we should already have the /ramdisk mount point though!!
+	system("sudo mount -t tmpfs -o size=64m tmpfs /ramdisk");
+	
+	fprintf(stderr, "Configuring port expander...\n");
+	//configure MCP23017 Port Expander and set outputs up
+	wiringPiSetup();
+	pinMode(0, OUTPUT);
+	digitalWrite(0, 1);		//enable port expander
+	
+	mcp23017Setup(100, 0x20);
+	
+	//setup ports on port expander - port B is switch inputs reqs pull high - port A is 
+	//0=RED, 1=GREEN, 2=BLUE, 3=SOUND HI/LO, 4=SOUND EN, 5=SYSFault LED, 6=NC, 7=NC
+	//Switches: 0=RESET Factory, 1=Wipe Config, 2=Test Mode, 3=, 4=, 5=, 6=, 7=
+	//Assuming numbering starts at portA0 to A7 then B0 to B7 so 100 to 107 and 108 to 115???
+	
+	pinMode(100, OUTPUT);
+	pinMode(101, OUTPUT);
+	pinMode(102, OUTPUT);
+	pinMode(103, OUTPUT);
+	pinMode(104, OUTPUT);
+	pinMode(105, OUTPUT);
+	pinMode(106, OUTPUT);
+	pinMode(107, OUTPUT);
+	pinMode(Piezo, PWM_OUTPUT);
+	pwmSetClock(1000);				//1000 seems to work when range is set to 10, test its stability ie no crashes!!
+	pwmSetRange(10);				//Supposedly should give us 1920Hz, hmm I'm not convinced! Check with a scope!
+	
+	//101 = green led, 100 = red, 102 = blue (active low!)
+	
+	digitalWrite(redled, 0);			//Initial state is white until system is happy
+	digitalWrite(grnled, 0);
+	digitalWrite(bluled, 0);
+	digitalWrite(103, 1);			//Sound Level  Set Hi
+	digitalWrite(104, 1);			//Sound Enable
+	sleep_ms(500);					//delay so lamp test is visible, just about
+	
+	pinMode(108, INPUT);
+	pinMode(109, INPUT);
+	pinMode(110, INPUT);
+	pinMode(111, INPUT);
+	pinMode(112, INPUT);
+	pinMode(113, INPUT);
+	pinMode(114, INPUT);
+	pinMode(115, INPUT);
+	pinMode(2, INPUT);			//This is GPIO27 
+	pullUpDnControl(108, PUD_UP);
+	pullUpDnControl(109, PUD_UP);
+	pullUpDnControl(110, PUD_UP);
+	pullUpDnControl(111, PUD_UP);
+	pullUpDnControl(112, PUD_UP);
+	pullUpDnControl(113, PUD_UP);
+	pullUpDnControl(114, PUD_UP);
+	pullUpDnControl(115, PUD_UP);
+	
+	pinMode (o_gpiopin, OUTPUT) ;
+	
+	fprintf(stderr, "Port expander configured...\n");	
+	
+	if(system("lsmod | grep tc358743") == 0)
+		HDMI_mode = 0;
+	else
+		HDMI_mode = 1;
+		
+	if(HDMI_mode == 0)
+	{
+		fprintf(stderr, "HDMI mode active\n");
+		system("sudo v4l2-ctl --set-edid=file=/home/pi/yavta/1080P50EDID.txt --fix-edid-checksums");
+		sleep_ms(1000);
+		system("sudo v4l2-ctl --set-dv-bt-timings index=11");
+		sleep_ms(1000);
+		system("v4l2-ctl --device /dev/video0 --set-fmt-video=width=1920,height=1080,pixelformat=UYVY");
+		sleep_ms(1000);
+		fprintf(stderr, "HDMI video parameters set\n");
+	}
+	else
+	{
+		fprintf(stderr, "CVBS mode active\n");
+		system("v4l2-ctl -d /dev/video0 -s pal");
+		sleep_ms(1000);
+		fprintf(stderr, "CVBS video parameters set\n");
+	}
+	
+	//Read auto reboot mode switch
+	fprintf(stderr, "Reading Auto Reboot on no CVBS signal switch configuration\n");
+	AutoReboot = digitalRead(112);
+	fprintf(stderr, "Switch is %d: ", AutoReboot);
+	if(AutoReboot == 0)
+		fprintf(stderr, "Auto Reboot is OFF\n");
+	else
+		fprintf(stderr, "Auto Reboot is ON\n");
+}
+
 int main(int argc, char *argv[])
 {
+	//Start ImagePort Hardware Configuration - Setup settings, Check mounted network drive, create GUID, Detect HDMI / CVBS and configure
+	setupgpio();
+	
+	trigger = 0;
+	CapFrameDone = 0;
+	StartLocalRTSPClient = 0;
+	
+	readStorageSettings();
+	CheckMount();
+	CreateGUID();
+	ApplySettings();
+	fprintf(stderr, "Settings Read Done!\n");
+	
+	//Boot wait - wait for drivers to finish configuring the hardware - maybe unnecessary though
+	//fprintf(stderr, "Waiting for 4 seconds to allow network wifi / ethernet DHCP to come up and stabilise connection!\n");
+	//sleep_ms(4000);
+	
+	//ImagePort Main Initialization Done - Continue with ISP and MMAL Configuration
 	struct sched_param sched;
 	struct device dev = {0};
 	int ret;
@@ -3052,8 +4176,8 @@ int main(int argc, char *argv[])
 	enum v4l2_memory memtype = V4L2_MEMORY_MMAP;
 	unsigned int pixelformat = V4L2_PIX_FMT_YUYV;
 	unsigned int fmt_flags = 0;
-	unsigned int width = 640;
-	unsigned int height = 480;
+	unsigned int width = 1920;
+	unsigned int height = 1080;
 	unsigned int stride = 0;
 	unsigned int buffer_size = 0;
 	unsigned int nbufs = V4L_BUFFERS_DEFAULT;
@@ -3063,6 +4187,13 @@ int main(int argc, char *argv[])
 	unsigned int userptr_offset = 0;
 	struct v4l2_fract time_per_frame = {1, 25};
 	enum v4l2_field field = V4L2_FIELD_ANY;
+
+	//CVBS override width and height settings
+	if(HDMI_mode == 1)
+	{
+		width = 720;
+		height = 576;
+	}
 
 	/* Capture loop */
 	enum buffer_fill_mode fill_mode = BUFFER_FILL_NONE;
